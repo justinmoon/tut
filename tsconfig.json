@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "target": "ES2022",
+    "types": ["bun", "react"]
+  },
+  "include": ["src/**/*.ts"]
+}
