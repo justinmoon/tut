@@ -726,8 +726,8 @@ function generateWithCodex(input: PromptInput, options: GenerateOptions): Genera
           outputPath,
           "--output-schema",
           schemaPath,
-          "--ask-for-approval",
-          "never",
+          "--sandbox",
+          "read-only",
           ...(options.model ? ["--model", options.model] : []),
           "-",
         ];
