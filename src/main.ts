@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import {
+  appendFileSync,
   closeSync,
   existsSync,
   mkdirSync,
@@ -13,6 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { createCliRenderer, type CliRenderer, type KeyEvent } from "@opentui/core";
@@ -21,6 +23,7 @@ import { createElement, useCallback, useEffect, useMemo, useState, type ReactNod
 
 type Provider = "claude" | "codex" | "none";
 type ReviewStatus = "generating" | "ready" | "failed";
+const VERSION = "0.1.5";
 
 interface TutorialDoc {
   executive_summary: string;
@@ -194,6 +197,9 @@ function parseArgs(argv: string[]) {
   const [maybeCommand, ...rest] = argv;
   if (maybeCommand === "-h" || maybeCommand === "--help") {
     return { kind: "help" as const };
+  }
+  if (maybeCommand === "-V" || maybeCommand === "--version" || maybeCommand === "version") {
+    return { kind: "version" as const };
   }
   if (maybeCommand === "fork") {
     return parseForkArgs(rest);
@@ -711,28 +717,30 @@ function generateWithCodex(input: PromptInput, options: GenerateOptions): Genera
   const schemaPath = join(dir, "schema.json");
   writeFileSync(schemaPath, JSON.stringify(tutorialJsonSchema(), null, 2));
 
-  const args =
-    options.forkSession?.provider === "codex"
-      ? [
-          "exec",
-          "resume",
-          "--output-last-message",
-          outputPath,
-          ...(options.model ? ["--model", options.model] : []),
-          options.forkSession.id,
-          "-",
-        ]
-      : [
-          "exec",
-          "--output-last-message",
-          outputPath,
-          "--output-schema",
-          schemaPath,
-          "--sandbox",
-          "read-only",
-          ...(options.model ? ["--model", options.model] : []),
-          "-",
-        ];
+  const tutorialSession = resolveCodexTutorialSession(input, options);
+  const args = tutorialSession
+    ? [
+        "exec",
+        "resume",
+        "--output-last-message",
+        outputPath,
+        "--output-schema",
+        schemaPath,
+        ...(options.model ? ["--model", options.model] : []),
+        tutorialSession.id,
+        "-",
+      ]
+    : [
+        "exec",
+        "--output-last-message",
+        outputPath,
+        "--output-schema",
+        schemaPath,
+        "--sandbox",
+        "read-only",
+        ...(options.model ? ["--model", options.model] : []),
+        "-",
+      ];
   const result = runWithStdin("codex", args, buildPrompt(input), options.cwd);
   if (!existsSync(outputPath)) {
     throw new Error(
@@ -741,8 +749,31 @@ function generateWithCodex(input: PromptInput, options: GenerateOptions): Genera
   }
   return {
     tutorial: parseTutorial(readFileSync(outputPath, "utf8")),
-    sessionId: options.forkSession?.provider === "codex" ? options.forkSession.id : undefined,
+    sessionId: tutorialSession?.id ?? parseCodexSessionId(result.stderr),
   };
+}
+
+/** Pick or create the Codex session that should generate the tutorial. */
+function resolveCodexTutorialSession(
+  input: PromptInput,
+  options: GenerateOptions,
+): AgentSessionRef | undefined {
+  if (options.forkSession?.provider === "codex") {
+    return options.forkSession;
+  }
+  if (options.sourceSession?.provider === "codex") {
+    return createCodexSessionFork(
+      options.sourceSession.id,
+      options.cwd,
+      `tut ${input.repo.name} ${input.repo.range ?? "changes"}`,
+    );
+  }
+  return undefined;
+}
+
+/** Extract the Codex session id printed by `codex exec` for fresh sessions. */
+function parseCodexSessionId(stderr: string) {
+  return stderr.match(/session id:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i)?.[1];
 }
 
 interface SpawnResultText {
@@ -1710,9 +1741,11 @@ export function chatCommandForReview(review: ReviewManifest): ChatCommand {
     return resumeSessionCommand(reviewSession, review.repoRoot);
   }
 
-  const sourceSession = maybeParseSessionRef(review.sourceSession);
-  if (sourceSession) {
-    return forkSessionCommand(sourceSession, reviewChatPrompt(review), review.repoRoot);
+  if (review.provider === "codex" && review.sessionId) {
+    return resumeSessionCommand({ provider: "codex", id: review.sessionId }, review.repoRoot);
+  }
+  if (review.provider === "claude" && review.sessionId) {
+    return resumeSessionCommand({ provider: "claude", id: review.sessionId }, review.repoRoot);
   }
 
   const forkSession = maybeParseSessionRef(review.forkSession);
@@ -1720,11 +1753,9 @@ export function chatCommandForReview(review: ReviewManifest): ChatCommand {
     return resumeSessionCommand(forkSession, review.repoRoot);
   }
 
-  if (review.provider === "codex" && review.sessionId) {
-    return resumeSessionCommand({ provider: "codex", id: review.sessionId }, review.repoRoot);
-  }
-  if (review.provider === "claude" && review.sessionId) {
-    return resumeSessionCommand({ provider: "claude", id: review.sessionId }, review.repoRoot);
+  const sourceSession = maybeParseSessionRef(review.sourceSession);
+  if (sourceSession) {
+    return forkSessionCommand(sourceSession, reviewChatPrompt(review), review.repoRoot);
   }
 
   throw new Error(
@@ -1773,6 +1804,86 @@ function forkSessionCommand(session: AgentSessionRef, prompt: string, cwd: strin
     return { command: "codex", args: ["fork", session.id, prompt], cwd };
   }
   return { command: "claude", args: ["-r", session.id, "--fork-session", prompt], cwd };
+}
+
+/** Create a local Codex session fork that `codex exec resume` can use non-interactively. */
+function createCodexSessionFork(sourceId: string, cwd: string, threadName: string): AgentSessionRef {
+  const sourcePath = findCodexSessionFile(sourceId);
+  if (!sourcePath) {
+    throw new Error(`Could not find Codex source session ${sourceId}.`);
+  }
+
+  const now = new Date();
+  const id = randomUUID();
+  const lines = readFileSync(sourcePath, "utf8").split("\n").filter(Boolean);
+  if (lines.length === 0) {
+    throw new Error(`Codex source session ${sourceId} is empty.`);
+  }
+
+  const meta = parseJsonObject(lines[0]!, "Codex session metadata") as {
+    type?: string;
+    timestamp?: string;
+    payload?: Record<string, unknown>;
+  };
+  if (meta.type !== "session_meta" || !meta.payload) {
+    throw new Error(`Codex source session ${sourceId} has no session metadata.`);
+  }
+
+  meta.timestamp = now.toISOString();
+  meta.payload = {
+    ...meta.payload,
+    id,
+    forked_from_id: sourceId,
+    timestamp: now.toISOString(),
+    cwd,
+  };
+
+  const targetDir = join(
+    homedir(),
+    ".codex",
+    "sessions",
+    String(now.getUTCFullYear()),
+    twoDigit(now.getUTCMonth() + 1),
+    twoDigit(now.getUTCDate()),
+  );
+  mkdirSync(targetDir, { recursive: true });
+  const targetPath = join(targetDir, `rollout-${codexFileTimestamp(now)}-${id}.jsonl`);
+  writeFileSync(targetPath, `${JSON.stringify(meta)}\n${lines.slice(1).join("\n")}\n`);
+  appendCodexSessionIndex(id, threadName, now);
+  return { provider: "codex", id };
+}
+
+/** Locate a Codex JSONL session file by id. */
+function findCodexSessionFile(id: string) {
+  const sessionsRoot = join(homedir(), ".codex", "sessions");
+  if (!existsSync(sessionsRoot)) {
+    return undefined;
+  }
+  return codexSessionFiles(sessionsRoot).find((path) => basename(path).includes(id));
+}
+
+/** Append a lightweight index entry so Codex pickers can discover the synthetic fork. */
+function appendCodexSessionIndex(id: string, threadName: string, now: Date) {
+  const indexPath = join(homedir(), ".codex", "session_index.jsonl");
+  const entry = {
+    id,
+    thread_name: threadName,
+    updated_at: now.toISOString(),
+  };
+  appendFileSync(indexPath, `${JSON.stringify(entry)}\n`);
+}
+
+/** Format one UTC date component as two digits. */
+function twoDigit(value: number) {
+  return String(value).padStart(2, "0");
+}
+
+/** Match Codex's session filename timestamp convention. */
+function codexFileTimestamp(value: Date) {
+  return [
+    `${value.getUTCFullYear()}-${twoDigit(value.getUTCMonth() + 1)}-${twoDigit(value.getUTCDate())}`,
+    `${twoDigit(value.getUTCHours())}-${twoDigit(value.getUTCMinutes())}-${twoDigit(value.getUTCSeconds())}`,
+  ].join("T");
 }
 
 /** Find the newest Codex session file created for this repo after launching a fork. */
@@ -2156,6 +2267,9 @@ function renderReviewPreview(review: ReviewManifest, width: number, height: numb
   if (review.reviewSession) {
     lines.push(`Review session: ${review.reviewSession}`);
   }
+  if (review.provider !== "none" && review.sessionId) {
+    lines.push(`Tutorial session: ${review.provider}:${review.sessionId}`);
+  }
   if (review.doneAt) {
     lines.push(`Done: ${review.doneAt}`);
   }
@@ -2261,6 +2375,9 @@ function renderReviewHint(manifest: ReviewManifest) {
     "review inbox:",
     "  tut inbox",
     "",
+    manifest.sessionId && manifest.provider !== "none"
+      ? `chat with tutorial session:\n  tut chat ${manifest.id}\n`
+      : "",
     manifest.sourceSession
       ? `fork source session:\n  tut fork ${manifest.sourceSession}\n`
       : "",
@@ -2333,6 +2450,8 @@ if (import.meta.main) {
     const parsed = parseArgs(process.argv.slice(2));
     if (parsed.kind === "help") {
       process.stdout.write(usage());
+    } else if (parsed.kind === "version") {
+      process.stdout.write(`tut ${VERSION}\n`);
     } else if (parsed.kind === "fork") {
       await runFork(parsed.session, parsed.prompt);
     } else if (parsed.kind === "inbox") {

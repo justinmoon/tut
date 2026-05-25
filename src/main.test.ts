@@ -185,7 +185,7 @@ describe("tut helpers", () => {
     expect(command.cwd).toBe("/repo");
   });
 
-  test("chat command prefers source session over tutorial provider session", () => {
+  test("chat command prefers tutorial provider session over source session", () => {
     const command = chatCommandForReview({
       id: "review-1",
       createdAt: "2026-05-24T00:00:00.000Z",
@@ -201,9 +201,11 @@ describe("tut helpers", () => {
       sourceSession: "codex:source-session",
     });
 
-    expect(command.command).toBe("codex");
-    expect(command.args[0]).toBe("fork");
-    expect(command.args[1]).toBe("source-session");
+    expect(command).toEqual({
+      command: "claude",
+      args: ["-r", "claude-tutorial-session"],
+      cwd: "/repo",
+    });
   });
 
   test("review matching accepts commit prefixes and exact ranges", () => {

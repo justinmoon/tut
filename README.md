@@ -117,10 +117,13 @@ tut HEAD~5..HEAD --provider none
 claude -p --output-format json --max-turns 1 --tools ""
 ```
 
-`codex` is called through non-interactive exec with structured output:
+`codex` is called through non-interactive exec with structured output. When a
+Codex source session is known, `tut` first creates a local fork of that session
+and generates the tutorial by resuming the fork:
 
 ```sh
 codex exec --output-last-message <tmp> --output-schema <tmp-schema> -
+codex exec resume --output-last-message <tmp> --output-schema <tmp-schema> <fork-session> -
 ```
 
 ## Agent Session Provenance
@@ -131,8 +134,10 @@ You can record the session that wrote the code:
 tut HEAD~5..HEAD --source-session codex:<session-id>
 ```
 
-That provenance is included in the prompt and Markdown. To fork the originating
-session for follow-up review:
+When Codex is the provider, that source session is forked for tutorial
+generation. The generated review records the fork as its tutorial session, so
+`c` and `tut chat <review-id>` resume the agent that generated the tutorial.
+To manually fork the originating session for follow-up review:
 
 ```sh
 tut fork codex:<session-id> "explain the riskiest part of this change"
@@ -149,10 +154,9 @@ tut chat
 tut chat <review-id>
 ```
 
-`chat` resumes a review session when one exists. On first open, if the review has
-the source session that wrote the code, it forks that source session so the
-original is not disturbed. For Codex, `tut` records the new review fork after the
-chat exits, so the next `c` or `tut chat <review-id>` resumes the same fork.
+`chat` resumes a review session when one exists, otherwise it resumes the
+tutorial generation session. If neither exists, it falls back to forking the
+source session so the original coding session is not disturbed.
 
 When `tut` runs inside Codex, it records `CODEX_THREAD_ID` as the review's
 source session automatically. You can also set `TUT_SOURCE_SESSION=codex:<id>`
