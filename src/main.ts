@@ -101,7 +101,6 @@ interface ReviewManifest {
   sessionId?: string;
   sourceSession?: string;
   forkSession?: string;
-  archived?: boolean;
 }
 
 interface AgentSessionRef {
@@ -157,7 +156,6 @@ function usage() {
     "  tut jobs",
     "  tut done <id-or-commit>",
     "  tut undone <id-or-commit>",
-    "  tut archive <id>",
     "  tut fork <claude|codex>:<session-id> [prompt]",
     "",
     "Generate a markdown tutorial and Hunk agent-context sidecar from a git diff.",
@@ -169,7 +167,7 @@ function usage() {
     "  --out <path>                Markdown output path (default: durable inbox artifact)",
     "  --sidecar-out <path>        Hunk sidecar output path (default: durable inbox artifact)",
     "  --tutorial-json <path>      Use an existing tutorial JSON response instead of calling a provider",
-    "  --provider <name>           claude, codex, or none (default: claude if present, else codex, else none)",
+    "  --provider <name>           claude, codex, or none (default: ambient agent if present, else claude/codex/none)",
     "  --model <name>              Provider model name",
     "  --max-diff-chars <n>        Diff prompt budget (default: 60000)",
     "  --source-session <ref>      Originating agent session, e.g. codex:<uuid> or claude:<uuid>",
@@ -228,9 +226,6 @@ function parseArgs(argv: string[]) {
   if (maybeCommand === "worker") {
     return { kind: "worker" as const, id: parseRequiredId(rest, "worker") };
   }
-  if (maybeCommand === "archive") {
-    return { kind: "archive" as const, id: parseRequiredId(rest, "archive") };
-  }
   if (maybeCommand === "generate") {
     return parseGenerateArgs(rest);
   }
@@ -256,6 +251,8 @@ function parseEnqueueArgs(argv: string[]) {
   let cwd = process.cwd();
   let provider: Provider | undefined;
   let model: string | undefined;
+  let sourceSession: AgentSessionRef | undefined;
+  let forkSession: AgentSessionRef | undefined;
   let maxDiffChars = 60_000;
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -279,6 +276,10 @@ function parseEnqueueArgs(argv: string[]) {
       provider = parsed;
     } else if (arg === "--model") {
       model = readValue();
+    } else if (arg === "--source-session") {
+      sourceSession = parseSessionRef(readValue());
+    } else if (arg === "--fork-session") {
+      forkSession = parseSessionRef(readValue());
     } else if (arg === "--max-diff-chars") {
       const parsed = Number.parseInt(readValue(), 10);
       if (!Number.isInteger(parsed) || parsed < 1_000) {
@@ -292,14 +293,17 @@ function parseEnqueueArgs(argv: string[]) {
     }
   }
 
+  const effectiveSourceSession = sourceSession ?? ambientSourceSession();
   return {
     kind: "enqueue" as const,
     ref,
     options: {
       cwd,
-      provider: provider ?? defaultProvider(),
+      provider: provider ?? defaultProvider(effectiveSourceSession),
       model,
       maxDiffChars,
+      sourceSession: effectiveSourceSession,
+      forkSession,
     },
   };
 }
@@ -392,6 +396,7 @@ function parseGenerateArgs(argv: string[]) {
     }
   }
 
+  const effectiveSourceSession = sourceSession ?? ambientSourceSession();
   return {
     kind: "generate" as const,
     options: {
@@ -403,10 +408,10 @@ function parseGenerateArgs(argv: string[]) {
       out: out ? resolve(cwd, out) : undefined,
       sidecarOut: sidecarOut ? resolve(cwd, sidecarOut) : undefined,
       tutorialJson: tutorialJson ? resolve(cwd, tutorialJson) : undefined,
-      provider: provider ?? defaultProvider(),
+      provider: provider ?? defaultProvider(effectiveSourceSession),
       model,
       maxDiffChars,
-      sourceSession,
+      sourceSession: effectiveSourceSession,
       forkSession,
     } satisfies GenerateOptions,
   };
@@ -430,8 +435,31 @@ function maybeParseSessionRef(raw?: string): AgentSessionRef | undefined {
   return parseSessionRef(raw);
 }
 
+/** Detect the coding-agent session running this command when the provider exposes it. */
+function ambientSourceSession(): AgentSessionRef | undefined {
+  const explicit = process.env.TUT_SOURCE_SESSION;
+  if (explicit) {
+    return parseSessionRef(explicit);
+  }
+  const codexThreadId = process.env.CODEX_THREAD_ID ?? process.env.CODEX_SESSION_ID;
+  if (codexThreadId) {
+    return { provider: "codex", id: codexThreadId };
+  }
+  const claudeSessionId = process.env.CLAUDE_SESSION_ID ?? process.env.CLAUDE_CODE_SESSION_ID;
+  if (claudeSessionId) {
+    return { provider: "claude", id: claudeSessionId };
+  }
+  return undefined;
+}
+
 /** Pick the first installed model provider, falling back to local heuristics. */
-function defaultProvider(): Provider {
+function defaultProvider(sourceSession = ambientSourceSession()): Provider {
+  if (sourceSession?.provider === "codex" && commandExists("codex")) {
+    return "codex";
+  }
+  if (sourceSession?.provider === "claude" && commandExists("claude")) {
+    return "claude";
+  }
   if (commandExists("claude")) {
     return "claude";
   }
@@ -1328,13 +1356,6 @@ function reviewsDir() {
   return dir;
 }
 
-/** Return the archived reviews directory, creating it on demand. */
-function archiveDir() {
-  const dir = join(reviewsDir(), ".archive");
-  mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
 /** Return the durable directory for one review id. */
 function reviewDir(id: string) {
   return join(reviewsDir(), id);
@@ -1472,24 +1493,6 @@ function runJobs() {
   }
 }
 
-/** Move one review manifest directory into the archive folder. */
-function archiveReview(id: string) {
-  const review = findReview(id);
-  const source = join(reviewsDir(), review.id);
-  const target = join(archiveDir(), review.id);
-  if (existsSync(target)) {
-    throw new Error(`Archive target already exists: ${target}`);
-  }
-  renameSync(source, target);
-  return review;
-}
-
-/** Move one review manifest directory into the archive folder. */
-function runArchive(id: string) {
-  const review = archiveReview(id);
-  process.stdout.write(`archived ${review.id}\n`);
-}
-
 /** Mark one ready review as done so it leaves the default inbox. */
 function runDone(id: string) {
   const review = findReview(id);
@@ -1530,7 +1533,14 @@ function assertReviewReady(review: ReviewManifest, action: string) {
 /** Queue tutorial generation for one commit and return immediately. */
 function runEnqueue(
   ref: string,
-  options: { cwd: string; provider: Provider; model?: string; maxDiffChars: number },
+  options: {
+    cwd: string;
+    provider: Provider;
+    model?: string;
+    maxDiffChars: number;
+    sourceSession?: AgentSessionRef;
+    forkSession?: AgentSessionRef;
+  },
 ) {
   const repoRoot = git(options.cwd, ["rev-parse", "--show-toplevel"]).trim();
   const repoName = detectRepoName(repoRoot);
@@ -1567,6 +1577,12 @@ function runEnqueue(
     logPath,
     maxDiffChars: options.maxDiffChars,
     ...(options.model ? { model: options.model } : {}),
+    ...(options.sourceSession
+      ? { sourceSession: `${options.sourceSession.provider}:${options.sourceSession.id}` }
+      : {}),
+    ...(options.forkSession
+      ? { forkSession: `${options.forkSession.provider}:${options.forkSession.id}` }
+      : {}),
   };
   writeManifest(manifest);
   const workerPid = startWorker(id, logPath);
@@ -1614,6 +1630,8 @@ async function runWorker(id: string) {
         provider: manifest.provider,
         model: manifest.model,
         maxDiffChars: manifest.maxDiffChars ?? 60_000,
+        sourceSession: maybeParseSessionRef(manifest.sourceSession),
+        forkSession: maybeParseSessionRef(manifest.forkSession),
       },
       {
         id: manifest.id,
@@ -1691,16 +1709,16 @@ export function chatCommandForReview(review: ReviewManifest): ChatCommand {
     return resumeSessionCommand(forkSession, review.repoRoot);
   }
 
+  const sourceSession = maybeParseSessionRef(review.sourceSession);
+  if (sourceSession) {
+    return forkSessionCommand(sourceSession, reviewChatPrompt(review), review.repoRoot);
+  }
+
   if (review.provider === "codex" && review.sessionId) {
     return resumeSessionCommand({ provider: "codex", id: review.sessionId }, review.repoRoot);
   }
   if (review.provider === "claude" && review.sessionId) {
     return resumeSessionCommand({ provider: "claude", id: review.sessionId }, review.repoRoot);
-  }
-
-  const sourceSession = maybeParseSessionRef(review.sourceSession);
-  if (sourceSession) {
-    return forkSessionCommand(sourceSession, reviewChatPrompt(review), review.repoRoot);
   }
 
   throw new Error(
@@ -1936,17 +1954,6 @@ function InboxApp({
       setMessage(`Undone ${selectedReview.id}`);
       return;
     }
-    if (isPlainKey(key, "d") && selectedReview) {
-      archiveReview(selectedReview.id);
-      const nextReviews = loadReviewManifests({ includeDone });
-      if (nextReviews.length === 0) {
-        onQuit();
-        return;
-      }
-      setReviews(nextReviews);
-      setSelected((current) => Math.min(current, nextReviews.length - 1));
-      setMessage(`Archived ${selectedReview.id}`);
-    }
   });
 
   return h(
@@ -1993,7 +2000,7 @@ function InboxApp({
       h(
         "text",
         { fg: busy ? "#f2c97d" : "#8e98aa" },
-        fit(busy ?? "Enter: Hunk  c: chat  m: markdown  x: done  u: undone  r: retry  d: archive  j/k: move  q: quit", terminal.width),
+        fit(busy ?? "Enter: Hunk  c: chat  m: markdown  x: done  u: undone  r: retry  j/k: move  q: quit", terminal.width),
       ),
       h("text", { fg: "#c77d7d" }, fit(message ?? "", terminal.width)),
     ),
@@ -2262,8 +2269,6 @@ if (import.meta.main) {
       runUndone(parsed.id);
     } else if (parsed.kind === "worker") {
       await runWorker(parsed.id);
-    } else if (parsed.kind === "archive") {
-      runArchive(parsed.id);
     } else {
       await runGenerate(parsed.options);
     }

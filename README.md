@@ -65,7 +65,6 @@ Keys:
 - `x`: mark the selected review done
 - `u`: restore the selected review from done
 - `r`: retry the selected failed or stale review
-- `d`: archive the selected review
 - `q`: quit
 
 Plain commands are also available:
@@ -78,7 +77,6 @@ tut chat <review-id>
 tut retry <review-id>
 tut done <review-id-or-commit>
 tut undone <review-id-or-commit>
-tut archive <review-id>
 ```
 
 Done reviews are hidden from the default inbox and list. Use `--all` to include
@@ -104,8 +102,8 @@ tut retry <review-id>
 
 ## Providers
 
-By default the CLI uses `claude` when present, then `codex`, then falls back to a
-local heuristic summary.
+By default the CLI uses the ambient coding agent when it can detect one, then
+`claude` when present, then `codex`, then a local heuristic summary.
 
 ```sh
 tut HEAD~5..HEAD --provider claude --model sonnet
@@ -154,6 +152,10 @@ tut chat <review-id>
 `chat` resumes a recorded fork session when one exists. If a review only has the
 source session that wrote the code, it opens a provider fork so the original
 session is not disturbed.
+
+When `tut` runs inside Codex, it records `CODEX_THREAD_ID` as the review's
+source session automatically. You can also set `TUT_SOURCE_SESSION=codex:<id>`
+or pass `--source-session codex:<id>` explicitly.
 
 When you already have a forked Codex session and want tutorial generation to use
 that mutable fork, pass both ids:
