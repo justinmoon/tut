@@ -96,6 +96,7 @@ interface ReviewManifest {
   logPath?: string;
   workerPid?: number;
   maxDiffChars?: number;
+  doneAt?: string;
   model?: string;
   sessionId?: string;
   sourceSession?: string;
@@ -148,12 +149,14 @@ function usage() {
     "  tut [range] [options]",
     "  tut generate [range] [options]",
     "  tut inbox",
-    "  tut list",
+    "  tut list [--all]",
     "  tut open <id>",
     "  tut chat [id]",
     "  tut enqueue [ref] [options]",
     "  tut retry <id>",
     "  tut jobs",
+    "  tut done <id-or-commit>",
+    "  tut undone <id-or-commit>",
     "  tut archive <id>",
     "  tut fork <claude|codex>:<session-id> [prompt]",
     "",
@@ -178,6 +181,7 @@ function usage() {
     "  tut --base origin/main --include-uncommitted",
     "  tut enqueue HEAD --cwd /path/to/repo",
     "  tut inbox",
+    "  tut done HEAD",
     "  tut chat",
     "  hunk diff HEAD~5..HEAD --agent-context tutorial.agent.json --agent-notes",
     "  tut fork codex:00000000-0000-0000-0000-000000000000 \"explain the risky part\"",
@@ -195,10 +199,10 @@ function parseArgs(argv: string[]) {
     return parseForkArgs(rest);
   }
   if (maybeCommand === "inbox") {
-    return { kind: "inbox" as const };
+    return { kind: "inbox" as const, includeDone: parseAllFlag(rest, "inbox") };
   }
   if (maybeCommand === "list") {
-    return { kind: "list" as const };
+    return { kind: "list" as const, includeDone: parseAllFlag(rest, "list") };
   }
   if (maybeCommand === "open") {
     return { kind: "open" as const, id: parseRequiredId(rest, "open") };
@@ -215,6 +219,12 @@ function parseArgs(argv: string[]) {
   if (maybeCommand === "jobs") {
     return { kind: "jobs" as const };
   }
+  if (maybeCommand === "done") {
+    return { kind: "done" as const, id: parseRequiredId(rest, "done") };
+  }
+  if (maybeCommand === "undone") {
+    return { kind: "undone" as const, id: parseRequiredId(rest, "undone") };
+  }
   if (maybeCommand === "worker") {
     return { kind: "worker" as const, id: parseRequiredId(rest, "worker") };
   }
@@ -225,6 +235,19 @@ function parseArgs(argv: string[]) {
     return parseGenerateArgs(rest);
   }
   return parseGenerateArgs(argv);
+}
+
+/** Parse the shared `--all` flag accepted by list-like commands. */
+function parseAllFlag(argv: string[], command: string) {
+  let includeDone = false;
+  for (const arg of argv) {
+    if (arg === "--all") {
+      includeDone = true;
+    } else {
+      throw new Error(`Unknown option for ${command}: ${arg}`);
+    }
+  }
+  return includeDone;
 }
 
 /** Parse a background enqueue request from a git hook or shell. */
@@ -443,6 +466,7 @@ async function generateReviewArtifacts(options: GenerateOptions, seed?: ReviewSe
   mkdirSync(reviewDir, { recursive: true });
   const markdownPath = options.out ?? seed?.markdownPath ?? join(reviewDir, "tutorial.md");
   const sidecarPath = options.sidecarOut ?? seed?.sidecarPath ?? join(reviewDir, "tutorial.agent.json");
+  const commitSha = seed?.commitSha ?? resolveRangeCommitSha(options.cwd, diffInput.rangeLabel);
   mkdirSync(dirname(markdownPath), { recursive: true });
   mkdirSync(dirname(sidecarPath), { recursive: true });
 
@@ -498,7 +522,7 @@ async function generateReviewArtifacts(options: GenerateOptions, seed?: ReviewSe
     sidecarPath,
     provider: options.provider,
     status: "ready",
-    ...(seed?.commitSha ? { commitSha: seed.commitSha } : {}),
+    ...(commitSha ? { commitSha } : {}),
     ...(seed?.startedAt ? { startedAt: seed.startedAt } : {}),
     finishedAt: new Date().toISOString(),
     ...(seed?.logPath ? { logPath: seed.logPath } : {}),
@@ -560,6 +584,16 @@ function resolveReviewTitle(cwd: string, rangeLabel: string) {
   const ref = end?.replace(/^\./, "").trim() || "HEAD";
   const subject = maybeGit(cwd, ["log", "-1", "--format=%s", ref])?.trim();
   return subject || rangeLabel;
+}
+
+/** Resolve the post-image commit for one commit-shaped range when Git can identify it. */
+function resolveRangeCommitSha(cwd: string, rangeLabel: string) {
+  const end = rangeLabel.includes("..") ? rangeLabel.split("..").pop() : rangeLabel;
+  const ref = end?.replace(/^\./, "").trim();
+  if (!ref) {
+    return undefined;
+  }
+  return maybeGit(cwd, ["rev-parse", `${ref}^{commit}`])?.trim() || undefined;
 }
 
 /** Resolve the default base branch using the same shape as Pika's local mode. */
@@ -1328,9 +1362,19 @@ function slugify(value: string) {
     .replace(/^-+|-+$/g, "");
 }
 
-/** Load all non-archived review manifests sorted newest first. */
-function loadReviewManifests() {
-  return readdirSync(reviewsDir(), { withFileTypes: true })
+/** Filter and sort active review manifests for list and inbox views. */
+export function visibleReviewManifests(
+  reviews: ReviewManifest[],
+  { includeDone = false }: { includeDone?: boolean } = {},
+) {
+  return reviews
+    .filter((review) => includeDone || !isReviewDone(review))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+}
+
+/** Load active review manifests sorted newest first. */
+function loadReviewManifests(options: { includeDone?: boolean } = {}) {
+  const reviews = readdirSync(reviewsDir(), { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && entry.name !== ".archive")
     .flatMap((entry) => {
       const path = manifestPath(entry.name);
@@ -1342,18 +1386,24 @@ function loadReviewManifests() {
       } catch {
         return [];
       }
-    })
-    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    });
+  return visibleReviewManifests(reviews, options);
 }
 
-/** Find a review by full id or unique prefix. */
+/** Find a review by id, id prefix, commit SHA prefix, or exact stored range. */
 function findReview(idOrPrefix: string) {
-  const reviews = loadReviewManifests();
+  const reviews = loadReviewManifests({ includeDone: true });
+  const resolvedCommitSha =
+    maybeGit(process.cwd(), ["rev-parse", `${idOrPrefix}^{commit}`])?.trim() || undefined;
   const exact = reviews.find((review) => review.id === idOrPrefix);
   if (exact) {
     return exact;
   }
-  const matches = reviews.filter((review) => review.id.startsWith(idOrPrefix));
+  const matches = reviews.filter(
+    (review) =>
+      reviewMatchesRef(review, idOrPrefix) ||
+      (resolvedCommitSha !== undefined && review.commitSha === resolvedCommitSha),
+  );
   if (matches.length === 1) {
     return matches[0]!;
   }
@@ -1363,29 +1413,54 @@ function findReview(idOrPrefix: string) {
   throw new Error(`No review found for id: ${idOrPrefix}`);
 }
 
+/** Match the common handles users have in hand when marking reviews. */
+export function reviewMatchesRef(review: ReviewManifest, value: string) {
+  const ref = value.trim();
+  if (!ref) {
+    return false;
+  }
+  return (
+    review.id.startsWith(ref) ||
+    review.commitSha?.startsWith(ref) ||
+    review.range === ref ||
+    review.range.startsWith(`${ref}^..`) ||
+    review.range.endsWith(`..${ref}`)
+  );
+}
+
 /** Treat old manifests without status as completed reviews. */
 function reviewStatus(review: ReviewManifest): ReviewStatus {
   return review.status ?? "ready";
 }
 
+/** Return whether a completed review has been hidden from the default inbox. */
+export function isReviewDone(review: ReviewManifest) {
+  return Boolean(review.doneAt);
+}
+
 /** Print a compact table of generated reviews. */
-function runList() {
-  const reviews = loadReviewManifests();
+function runList(includeDone = false) {
+  const reviews = loadReviewManifests({ includeDone });
   if (reviews.length === 0) {
-    process.stdout.write(`No reviews in ${reviewsDir()}\n`);
+    process.stdout.write(
+      includeDone
+        ? `No reviews in ${reviewsDir()}\n`
+        : `No active reviews in ${reviewsDir()} (use --all to include done reviews)\n`,
+    );
     return;
   }
   for (const review of reviews) {
     const status = reviewStatus(review);
+    const done = isReviewDone(review) ? " done" : "";
     process.stdout.write(
-      `${review.id}  ${status}  ${review.repoName}  ${review.range}  ${review.title}\n`,
+      `${review.id}  ${status}${done}  ${review.repoName}  ${review.range}  ${review.title}\n`,
     );
   }
 }
 
 /** Print active or failed background generation jobs. */
 function runJobs() {
-  const jobs = loadReviewManifests().filter((review) => reviewStatus(review) !== "ready");
+  const jobs = loadReviewManifests({ includeDone: true }).filter((review) => reviewStatus(review) !== "ready");
   if (jobs.length === 0) {
     process.stdout.write("No tutorial jobs.\n");
     return;
@@ -1413,6 +1488,22 @@ function archiveReview(id: string) {
 function runArchive(id: string) {
   const review = archiveReview(id);
   process.stdout.write(`archived ${review.id}\n`);
+}
+
+/** Mark one ready review as done so it leaves the default inbox. */
+function runDone(id: string) {
+  const review = findReview(id);
+  assertReviewReady(review, "mark done");
+  writeManifest({ ...review, doneAt: review.doneAt ?? new Date().toISOString() });
+  process.stdout.write(`done ${review.id}\n`);
+}
+
+/** Restore one done review to the default inbox. */
+function runUndone(id: string) {
+  const review = findReview(id);
+  const { doneAt: _doneAt, ...rest } = review;
+  writeManifest(rest);
+  process.stdout.write(`undone ${review.id}\n`);
 }
 
 /** Open one review in Hunk using its generated sidecar. */
@@ -1445,7 +1536,7 @@ function runEnqueue(
   const repoName = detectRepoName(repoRoot);
   const commitSha = git(repoRoot, ["rev-parse", `${ref}^{commit}`]).trim();
   const shortSha = git(repoRoot, ["rev-parse", "--short", commitSha]).trim();
-  const existing = loadReviewManifests().find(
+  const existing = loadReviewManifests({ includeDone: true }).find(
     (review) => review.repoRoot === repoRoot && review.commitSha === commitSha,
   );
   if (existing) {
@@ -1667,10 +1758,14 @@ interface InboxState {
 }
 
 /** Run the OpenTUI tutorial inbox. */
-async function runInbox() {
-  const reviews = loadReviewManifests();
+async function runInbox(includeDone = false) {
+  const reviews = loadReviewManifests({ includeDone });
   if (reviews.length === 0) {
-    process.stdout.write(`No reviews in ${reviewsDir()}\n`);
+    process.stdout.write(
+      includeDone
+        ? `No reviews in ${reviewsDir()}\n`
+        : `No active reviews in ${reviewsDir()} (use --all to include done reviews)\n`,
+    );
     return;
   }
 
@@ -1688,16 +1783,18 @@ async function runInbox() {
       renderer.destroy();
       resolveQuit();
     };
-    root.render(createElement(InboxApp, { initialReviews: reviews, onQuit: shutdown }));
+    root.render(createElement(InboxApp, { initialReviews: reviews, includeDone, onQuit: shutdown }));
   });
 }
 
 /** Render the inbox and keep it alive while child tools are suspended. */
 function InboxApp({
   initialReviews,
+  includeDone,
   onQuit,
 }: {
   initialReviews: ReviewManifest[];
+  includeDone: boolean;
   onQuit: () => void;
 }) {
   const renderer = useRenderer();
@@ -1709,11 +1806,12 @@ function InboxApp({
 
   useEffect(() => {
     const timer = setInterval(() => {
-      setReviews(loadReviewManifests());
-      setSelected((current) => Math.min(current, Math.max(0, loadReviewManifests().length - 1)));
+      const nextReviews = loadReviewManifests({ includeDone });
+      setReviews(nextReviews);
+      setSelected((current) => Math.min(current, Math.max(0, nextReviews.length - 1)));
     }, 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [includeDone]);
 
   const selectedReview = reviews[selected];
   const listWidth = Math.min(42, Math.max(28, Math.floor(terminal.width * 0.34)));
@@ -1816,13 +1914,31 @@ function InboxApp({
     }
     if (isPlainKey(key, "r") && selectedReview) {
       runRetry(selectedReview.id);
-      setReviews(loadReviewManifests());
+      setReviews(loadReviewManifests({ includeDone }));
       setMessage(`Retrying ${selectedReview.id}`);
+      return;
+    }
+    if (isPlainKey(key, "x") && selectedReview) {
+      runDone(selectedReview.id);
+      const nextReviews = loadReviewManifests({ includeDone });
+      if (nextReviews.length === 0) {
+        onQuit();
+        return;
+      }
+      setReviews(nextReviews);
+      setSelected((current) => Math.min(current, nextReviews.length - 1));
+      setMessage(`Done ${selectedReview.id}`);
+      return;
+    }
+    if (isPlainKey(key, "u") && selectedReview) {
+      runUndone(selectedReview.id);
+      setReviews(loadReviewManifests({ includeDone }));
+      setMessage(`Undone ${selectedReview.id}`);
       return;
     }
     if (isPlainKey(key, "d") && selectedReview) {
       archiveReview(selectedReview.id);
-      const nextReviews = loadReviewManifests();
+      const nextReviews = loadReviewManifests({ includeDone });
       if (nextReviews.length === 0) {
         onQuit();
         return;
@@ -1853,7 +1969,11 @@ function InboxApp({
           const absolute = scroll + index;
           const active = absolute === selected;
           const status = reviewStatus(review);
-          const suffix = status === "ready" ? "" : ` [${status}]`;
+          const suffix = isReviewDone(review)
+            ? " [done]"
+            : status === "ready"
+              ? ""
+              : ` [${status}]`;
           const title = `${review.repoName.split("/").pop()} ${review.range}${suffix}`;
           return h("text", { key: review.id, fg: active ? "#f5f7fb" : "#aab2c0" }, fit(`${active ? ">" : " "} ${title}`, listWidth));
         }),
@@ -1873,7 +1993,7 @@ function InboxApp({
       h(
         "text",
         { fg: busy ? "#f2c97d" : "#8e98aa" },
-        fit(busy ?? "Enter: Hunk  c: chat  m: markdown  r: retry  d: archive  j/k: move  q: quit", terminal.width),
+        fit(busy ?? "Enter: Hunk  c: chat  m: markdown  x: done  u: undone  r: retry  d: archive  j/k: move  q: quit", terminal.width),
       ),
       h("text", { fg: "#c77d7d" }, fit(message ?? "", terminal.width)),
     ),
@@ -1946,6 +2066,9 @@ function renderReviewPreview(review: ReviewManifest, width: number, height: numb
   const lines: string[] = [];
   lines.push(review.title);
   lines.push(`${review.repoName}  ${review.range}`);
+  if (review.doneAt) {
+    lines.push(`Done: ${review.doneAt}`);
+  }
   lines.push("");
   const status = reviewStatus(review);
   if (status !== "ready") {
@@ -2120,9 +2243,9 @@ if (import.meta.main) {
     } else if (parsed.kind === "fork") {
       await runFork(parsed.session, parsed.prompt);
     } else if (parsed.kind === "inbox") {
-      await runInbox();
+      await runInbox(parsed.includeDone);
     } else if (parsed.kind === "list") {
-      runList();
+      runList(parsed.includeDone);
     } else if (parsed.kind === "open") {
       await runOpen(parsed.id);
     } else if (parsed.kind === "chat") {
@@ -2133,6 +2256,10 @@ if (import.meta.main) {
       runRetry(parsed.id);
     } else if (parsed.kind === "jobs") {
       runJobs();
+    } else if (parsed.kind === "done") {
+      runDone(parsed.id);
+    } else if (parsed.kind === "undone") {
+      runUndone(parsed.id);
     } else if (parsed.kind === "worker") {
       await runWorker(parsed.id);
     } else if (parsed.kind === "archive") {

@@ -54,6 +54,9 @@ Keys:
 - `Enter`: open the selected review in Hunk with its sidecar notes
 - `c`: open the selected review's agent chat session
 - `m`: open the selected Markdown tutorial in `$PAGER`
+- `x`: mark the selected review done
+- `u`: restore the selected review from done
+- `r`: retry the selected failed or stale review
 - `d`: archive the selected review
 - `q`: quit
 
@@ -61,11 +64,17 @@ Plain commands are also available:
 
 ```sh
 tut list
+tut list --all
 tut open <review-id>
 tut chat <review-id>
 tut retry <review-id>
+tut done <review-id-or-commit>
+tut undone <review-id-or-commit>
 tut archive <review-id>
 ```
+
+Done reviews are hidden from the default inbox and list. Use `--all` to include
+them again.
 
 ## Background Generation
 

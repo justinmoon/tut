@@ -4,7 +4,10 @@ import {
   chatCommandForReview,
   extractJsonPayload,
   heuristicFromDiff,
+  isReviewDone,
   parseUnifiedHunkHeader,
+  reviewMatchesRef,
+  visibleReviewManifests,
 } from "./main.ts";
 
 describe("tut helpers", () => {
@@ -157,5 +160,48 @@ describe("tut helpers", () => {
     expect(command.args[1]).toBe("source-session");
     expect(command.args[2]).toContain("Range: abc^..abc");
     expect(command.cwd).toBe("/repo");
+  });
+
+  test("review matching accepts commit prefixes and exact ranges", () => {
+    const review = {
+      id: "2026-demo-abcdef0",
+      createdAt: "2026-05-24T00:00:00.000Z",
+      repoRoot: "/repo",
+      repoName: "owner/repo",
+      range: "abcdef0^..abcdef0",
+      title: "demo",
+      summary: "summary",
+      markdownPath: "/review/tutorial.md",
+      sidecarPath: "/review/tutorial.agent.json",
+      provider: "claude" as const,
+      commitSha: "abcdef0123456789",
+    };
+
+    expect(reviewMatchesRef(review, "abcdef0")).toBe(true);
+    expect(reviewMatchesRef(review, "abcdef0123")).toBe(true);
+    expect(reviewMatchesRef(review, "abcdef0^..abcdef0")).toBe(true);
+    expect(reviewMatchesRef(review, "1234567")).toBe(false);
+  });
+
+  test("done reviews are hidden unless requested", () => {
+    const ready = {
+      id: "ready",
+      createdAt: "2026-05-24T00:00:00.000Z",
+      repoRoot: "/repo",
+      repoName: "owner/repo",
+      range: "a^..a",
+      title: "ready",
+      summary: "summary",
+      markdownPath: "/review/tutorial.md",
+      sidecarPath: "/review/tutorial.agent.json",
+      provider: "claude" as const,
+    };
+    const done = { ...ready, id: "done", createdAt: "2026-05-25T00:00:00.000Z", doneAt: "2026-05-25T01:00:00.000Z" };
+
+    expect(isReviewDone(done)).toBe(true);
+    expect(visibleReviewManifests([ready, done]).map((review) => review.id)).toEqual(["ready"]);
+    expect(
+      visibleReviewManifests([ready, done], { includeDone: true }).map((review) => review.id),
+    ).toEqual(["done", "ready"]);
   });
 });
