@@ -149,9 +149,10 @@ tut chat
 tut chat <review-id>
 ```
 
-`chat` resumes a recorded fork session when one exists. If a review only has the
-source session that wrote the code, it opens a provider fork so the original
-session is not disturbed.
+`chat` resumes a review session when one exists. On first open, if the review has
+the source session that wrote the code, it forks that source session so the
+original is not disturbed. For Codex, `tut` records the new review fork after the
+chat exits, so the next `c` or `tut chat <review-id>` resumes the same fork.
 
 When `tut` runs inside Codex, it records `CODEX_THREAD_ID` as the review's
 source session automatically. You can also set `TUT_SOURCE_SESSION=codex:<id>`

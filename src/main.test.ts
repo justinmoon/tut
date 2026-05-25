@@ -140,6 +140,29 @@ describe("tut helpers", () => {
     });
   });
 
+  test("chat command resumes a recorded review session first", () => {
+    const command = chatCommandForReview({
+      id: "review-1",
+      createdAt: "2026-05-24T00:00:00.000Z",
+      repoRoot: "/repo",
+      repoName: "owner/repo",
+      range: "abc^..abc",
+      title: "demo",
+      summary: "summary",
+      markdownPath: "/review/tutorial.md",
+      sidecarPath: "/review/tutorial.agent.json",
+      provider: "codex",
+      reviewSession: "codex:review-session",
+      sourceSession: "codex:source-session",
+    });
+
+    expect(command).toEqual({
+      command: "codex",
+      args: ["resume", "review-session"],
+      cwd: "/repo",
+    });
+  });
+
   test("chat command forks a recorded codex source session", () => {
     const command = chatCommandForReview({
       id: "review-1",

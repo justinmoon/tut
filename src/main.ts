@@ -9,6 +9,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
@@ -101,6 +102,7 @@ interface ReviewManifest {
   sessionId?: string;
   sourceSession?: string;
   forkSession?: string;
+  reviewSession?: string;
 }
 
 interface AgentSessionRef {
@@ -1688,8 +1690,7 @@ interface ChatCommand {
 async function runChat(id?: string) {
   const review = id ? findReview(id) : findDefaultChatReview(process.cwd());
   assertReviewReady(review, "open chat");
-  const command = chatCommandForReview(review);
-  await spawnInteractive(command.command, command.args, command.cwd);
+  await openReviewChat(review);
 }
 
 /** Choose the newest review for the current repo, falling back to the newest global review. */
@@ -1704,14 +1705,19 @@ function findDefaultChatReview(cwd: string) {
 
 /** Build the interactive provider command for a review without taking over chat rendering. */
 export function chatCommandForReview(review: ReviewManifest): ChatCommand {
-  const forkSession = maybeParseSessionRef(review.forkSession);
-  if (forkSession) {
-    return resumeSessionCommand(forkSession, review.repoRoot);
+  const reviewSession = maybeParseSessionRef(review.reviewSession);
+  if (reviewSession) {
+    return resumeSessionCommand(reviewSession, review.repoRoot);
   }
 
   const sourceSession = maybeParseSessionRef(review.sourceSession);
   if (sourceSession) {
     return forkSessionCommand(sourceSession, reviewChatPrompt(review), review.repoRoot);
+  }
+
+  const forkSession = maybeParseSessionRef(review.forkSession);
+  if (forkSession) {
+    return resumeSessionCommand(forkSession, review.repoRoot);
   }
 
   if (review.provider === "codex" && review.sessionId) {
@@ -1722,8 +1728,35 @@ export function chatCommandForReview(review: ReviewManifest): ChatCommand {
   }
 
   throw new Error(
-    `Review ${review.id} has no forkSession, provider sessionId, or sourceSession to chat with.`,
+    `Review ${review.id} has no reviewSession, sourceSession, forkSession, or provider sessionId to chat with.`,
   );
+}
+
+/** Open chat and persist the created review fork when the provider exposes it locally. */
+async function openReviewChat(review: ReviewManifest) {
+  const command = chatCommandForReview(review);
+  const startedAt = Date.now();
+  await spawnInteractive(command.command, command.args, command.cwd);
+  maybeRecordReviewSession(review, command, startedAt);
+}
+
+/** Save the first Codex review fork so future `c` resumes instead of forking again. */
+function maybeRecordReviewSession(review: ReviewManifest, command: ChatCommand, startedAt: number) {
+  if (
+    review.reviewSession ||
+    command.command !== "codex" ||
+    command.args[0] !== "fork" ||
+    !command.args[1]
+  ) {
+    return;
+  }
+
+  const forkedId = findRecentCodexSessionId(startedAt, review.repoRoot, command.args[1]);
+  if (!forkedId) {
+    return;
+  }
+  const latest = findReview(review.id);
+  writeManifest({ ...latest, reviewSession: `codex:${forkedId}` });
 }
 
 /** Build a provider resume command for an existing mutable chat session. */
@@ -1740,6 +1773,50 @@ function forkSessionCommand(session: AgentSessionRef, prompt: string, cwd: strin
     return { command: "codex", args: ["fork", session.id, prompt], cwd };
   }
   return { command: "claude", args: ["-r", session.id, "--fork-session", prompt], cwd };
+}
+
+/** Find the newest Codex session file created for this repo after launching a fork. */
+function findRecentCodexSessionId(startedAt: number, repoRoot: string, sourceId: string) {
+  const sessionsRoot = join(homedir(), ".codex", "sessions");
+  if (!existsSync(sessionsRoot)) {
+    return undefined;
+  }
+  const candidates = codexSessionFiles(sessionsRoot)
+    .flatMap((path) => {
+      const match = basename(path).match(/-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+      if (!match) {
+        return [];
+      }
+      const stats = statSync(path);
+      if (stats.mtimeMs < startedAt - 2_000 || match[1] === sourceId) {
+        return [];
+      }
+      return [{ id: match[1]!, path, mtimeMs: stats.mtimeMs }];
+    })
+    .filter((candidate) => codexSessionMentionsRepo(candidate.path, repoRoot))
+    .sort((left, right) => right.mtimeMs - left.mtimeMs);
+
+  return candidates[0]?.id;
+}
+
+/** Recursively enumerate Codex JSONL session files. */
+function codexSessionFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      return codexSessionFiles(path);
+    }
+    return entry.isFile() && entry.name.endsWith(".jsonl") ? [path] : [];
+  });
+}
+
+/** Check a recent session cheaply for the repo root in its serialized context. */
+function codexSessionMentionsRepo(path: string, repoRoot: string) {
+  try {
+    return readFileSync(path, "utf8").includes(`"cwd":"${repoRoot}"`);
+  } catch {
+    return false;
+  }
 }
 
 /** Seed a forked chat with the review artifacts the user is looking at. */
@@ -1876,8 +1953,8 @@ function InboxApp({
       setMessage(null);
       renderer.suspend();
       try {
-        const command = chatCommandForReview(review);
-        await spawnInteractive(command.command, command.args, command.cwd);
+        await openReviewChat(review);
+        setReviews(loadReviewManifests({ includeDone }));
       } catch (error) {
         setMessage(error instanceof Error ? error.message : String(error));
       } finally {
@@ -2073,6 +2150,12 @@ function renderReviewPreview(review: ReviewManifest, width: number, height: numb
   const lines: string[] = [];
   lines.push(review.title);
   lines.push(`${review.repoName}  ${review.range}`);
+  if (review.sourceSession) {
+    lines.push(`Source session: ${review.sourceSession}`);
+  }
+  if (review.reviewSession) {
+    lines.push(`Review session: ${review.reviewSession}`);
+  }
   if (review.doneAt) {
     lines.push(`Done: ${review.doneAt}`);
   }
@@ -2180,6 +2263,9 @@ function renderReviewHint(manifest: ReviewManifest) {
     "",
     manifest.sourceSession
       ? `fork source session:\n  tut fork ${manifest.sourceSession}\n`
+      : "",
+    manifest.reviewSession
+      ? `continue review session:\n  tut chat ${manifest.id}\n`
       : "",
     manifest.forkSession
       ? `continue tutorial fork:\n  tut fork ${manifest.forkSession}\n`
