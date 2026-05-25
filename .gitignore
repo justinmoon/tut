@@ -1,3 +1,4 @@
 node_modules/
 tutorial.md
 tutorial.agent.json
+dist/tut-aarch64-darwin

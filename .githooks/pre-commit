@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+bun -e '
+const pkg = await Bun.file("package.json").json();
+if ("scripts" in pkg) {
+  console.error("package.json must not define scripts; use justfile recipes instead.");
+  process.exit(1);
+}
+'

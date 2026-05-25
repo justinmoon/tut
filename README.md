@@ -16,6 +16,14 @@ It follows the small `pika-git local` pattern:
 tut HEAD~5..HEAD --about "session daemon changes"
 ```
 
+From a checkout, use the justfile before installing a new release:
+
+```sh
+just run --help
+just run HEAD~5..HEAD --provider none
+just check
+```
+
 By default this writes a durable review item under:
 
 ```text

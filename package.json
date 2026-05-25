@@ -6,13 +6,6 @@
   "bin": {
     "tut": "./src/main.ts"
   },
-  "scripts": {
-    "build:bin": "bun build --compile ./src/main.ts --outfile ./dist/tut-aarch64-darwin",
-    "build:release": "bun run build:bin && gzip -9 -c ./dist/tut-aarch64-darwin > ./dist/tut-aarch64-darwin.gz",
-    "start": "bun run src/main.ts",
-    "typecheck": "tsc --noEmit",
-    "test": "bun test"
-  },
   "devDependencies": {
     "@types/bun": "1.3.13",
     "@types/react": "^19.2.15",
