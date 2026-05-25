@@ -13,7 +13,7 @@
       default = self.packages.${system}.tut;
       tut = pkgs.stdenvNoCC.mkDerivation {
         pname = "tut";
-        version = "0.1.1";
+        version = "0.1.2";
         src = ./dist/tut-aarch64-darwin.gz;
         dontUnpack = true;
         nativeBuildInputs = [ pkgs.gzip ];
